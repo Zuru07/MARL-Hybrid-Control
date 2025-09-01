@@ -302,47 +302,67 @@ class MultiAgentTrainer:
         self.episode_rewards = []
         self.success_rates = []
 
+    # def select_joint_action(self, states, graph_data, evaluate=False):
+    #     """Selects a joint action for all agents, with optional hybrid supervisor."""
+    #     actions = []
+    #     with torch.no_grad():
+    #         for i in range(self.num_agents):
+    #             # --- CHANGE START --- : Hybrid Rule-Based Supervisor
+    #             time_left = self.env.time_remaining[i]
+    #             pos = self.env.positions[i]
+                
+    #             # Find nearest neighbor distance
+    #             min_dist = float('inf')
+    #             for j in range(self.num_agents):
+    #                 if i != j:
+    #                     dist = np.linalg.norm(pos - self.env.positions[j])
+    #                     if dist < min_dist:
+    #                         min_dist = dist
+                
+    #             # Rule 1: Emergency collision avoidance
+    #             if min_dist < self.env.collision_radius * 1.5:
+    #                 # Move away from the average position of other agents
+    #                 avg_pos_others = np.mean([self.env.positions[j] for j in range(self.num_agents) if i != j], axis=0)
+    #                 avoid_vec = pos - avg_pos_others
+    #                 action_vec = avoid_vec / (np.linalg.norm(avoid_vec) + 1e-6)
+    #             # Rule 2: Rush to goal if time is low
+    #             elif time_left < 2.0: # 2 seconds threshold
+    #                 goal_vec = self.env.goals[i] - pos
+    #                 action_vec = goal_vec / (np.linalg.norm(goal_vec) + 1e-6)
+    #             # Default: Use the learned actor policy
+    #             else:
+    #                 state_tensor = torch.FloatTensor(states[i]).unsqueeze(0).to(self.device)
+    #                 agent_graph_data = Data(x=graph_data.x, edge_index=graph_data.edge_index, agent_index=i).to(self.device)
+    #                 if evaluate:
+    #                     mean, _ = self.actors[i](state_tensor, agent_graph_data)
+    #                     action_tensor = torch.tanh(mean)
+    #                 else:
+    #                     action_tensor, _ = self.actors[i].sample(state_tensor, agent_graph_data)
+    #                 action_vec = action_tensor.cpu().numpy().flatten()
+                
+    #             actions.append(action_vec)
+    #             # --- CHANGE END ---
+
+    #     return np.array(actions)
+    # In MultiAgentTrainer class
+    
     def select_joint_action(self, states, graph_data, evaluate=False):
-        """Selects a joint action for all agents, with optional hybrid supervisor."""
+        """Selects a joint action for all agents."""
         actions = []
         with torch.no_grad():
             for i in range(self.num_agents):
-                # --- CHANGE START --- : Hybrid Rule-Based Supervisor
-                time_left = self.env.time_remaining[i]
-                pos = self.env.positions[i]
-                
-                # Find nearest neighbor distance
-                min_dist = float('inf')
-                for j in range(self.num_agents):
-                    if i != j:
-                        dist = np.linalg.norm(pos - self.env.positions[j])
-                        if dist < min_dist:
-                            min_dist = dist
-                
-                # Rule 1: Emergency collision avoidance
-                if min_dist < self.env.collision_radius * 1.5:
-                    # Move away from the average position of other agents
-                    avg_pos_others = np.mean([self.env.positions[j] for j in range(self.num_agents) if i != j], axis=0)
-                    avoid_vec = pos - avg_pos_others
-                    action_vec = avoid_vec / (np.linalg.norm(avoid_vec) + 1e-6)
-                # Rule 2: Rush to goal if time is low
-                elif time_left < 2.0: # 2 seconds threshold
-                    goal_vec = self.env.goals[i] - pos
-                    action_vec = goal_vec / (np.linalg.norm(goal_vec) + 1e-6)
-                # Default: Use the learned actor policy
+                # --- CHANGE: TEMPORARILY DISABLE SUPERVISOR ---
+                # The original supervisor logic is commented out for this test.
+                # We now ALWAYS use the learned actor policy.
+                state_tensor = torch.FloatTensor(states[i]).unsqueeze(0).to(self.device)
+                agent_graph_data = Data(x=graph_data.x, edge_index=graph_data.edge_index, agent_index=i).to(self.device)
+                if evaluate:
+                    mean, _ = self.actors[i](state_tensor, agent_graph_data)
+                    action_tensor = torch.tanh(mean)
                 else:
-                    state_tensor = torch.FloatTensor(states[i]).unsqueeze(0).to(self.device)
-                    agent_graph_data = Data(x=graph_data.x, edge_index=graph_data.edge_index, agent_index=i).to(self.device)
-                    if evaluate:
-                        mean, _ = self.actors[i](state_tensor, agent_graph_data)
-                        action_tensor = torch.tanh(mean)
-                    else:
-                        action_tensor, _ = self.actors[i].sample(state_tensor, agent_graph_data)
-                    action_vec = action_tensor.cpu().numpy().flatten()
-                
+                    action_tensor, _ = self.actors[i].sample(state_tensor, agent_graph_data)
+                action_vec = action_tensor.cpu().numpy().flatten()
                 actions.append(action_vec)
-                # --- CHANGE END ---
-
         return np.array(actions)
 
     def train(self):
