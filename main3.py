@@ -17,11 +17,8 @@ np.random.seed(42)
 random.seed(42)
 
 # --- Core Components ---
-
-# --- CHANGE START ---
-# Transition now stores joint states and actions for the shared replay buffer
+# Transition stores joint states and actions for the shared replay buffer
 Transition = namedtuple('Transition', ['joint_state', 'joint_action', 'reward', 'joint_next_state', 'done'])
-# --- CHANGE END ---
 
 class ReplayBuffer:
     """A shared replay buffer for all agents."""
@@ -40,7 +37,6 @@ class ReplayBuffer:
 
 # --- Agent Networks (Actor & Centralized Critic) ---
 
-# Graph Neural Network for Actor communication
 class GNNLayer(MessagePassing):
     """GNN layer for message passing between agents."""
     def __init__(self, input_dim, output_dim):
@@ -111,12 +107,10 @@ class Actor(nn.Module):
         log_prob = log_prob.sum(1, keepdim=True)
         return action, log_prob
 
-# --- CHANGE START ---
 class Critic(nn.Module):
     """Centralized critic network that observes all agents."""
     def __init__(self, num_agents, state_dim, action_dim, hidden_dim=256):
         super(Critic, self).__init__()
-        # Input is all states and all actions concatenated
         input_dim = num_agents * (state_dim + action_dim)
         
         self.q1 = nn.Sequential(
@@ -131,11 +125,9 @@ class Critic(nn.Module):
         )
         
     def forward(self, all_states, all_actions):
-        # Concatenate states and actions, then flatten for the MLP
         x = torch.cat([all_states, all_actions], dim=-1)
-        x = x.view(x.size(0), -1)  # Flatten from [batch, num_agents, features] to [batch, num_agents * features]
+        x = x.view(x.size(0), -1)
         return self.q1(x), self.q2(x)
-# --- CHANGE END ---
 
 # --- Simulation Environment ---
 
@@ -162,7 +154,6 @@ class MultiAgentEnvironment:
         self.goals = np.random.uniform(-self.world_size / 2, self.world_size / 2, (self.num_agents, 2))
         
         distances_to_goal = np.linalg.norm(self.goals - self.positions, axis=1)
-        # --- CHANGE --- : Shorter, more challenging time limits
         self.time_limits = distances_to_goal / (self.max_speed * 0.8) + 3.0
         self.time_remaining = self.time_limits.copy()
         
@@ -175,10 +166,9 @@ class MultiAgentEnvironment:
         """Returns a normalized observation for each agent."""
         observations = []
         for i in range(self.num_agents):
-            # --- CHANGE --- : Normalize inputs to be in a consistent range [-1, 1]
             pos_norm = self.positions[i] / (self.world_size / 2)
             vel_norm = self.velocities[i] / self.max_speed
-            time_norm = np.clip(self.time_remaining[i] / self.time_limits[i], 0, 1) * 2 - 1 # to [-1, 1]
+            time_norm = np.clip(self.time_remaining[i] / self.time_limits[i], 0, 1) * 2 - 1
 
             obs = np.concatenate([pos_norm, vel_norm, [time_norm]])
             observations.append(obs)
@@ -215,14 +205,16 @@ class MultiAgentEnvironment:
         return self.get_observations(), reward, self.done, {}
     
     def calculate_rewards(self):
-        """Calculates a shared team reward with stronger signals."""
+        """Calculates a shared team reward with hybrid logic."""
         team_reward = 0.0
         
-        # --- CHANGE --- : Strengthened reward/penalty signals
+        is_urgent_mode = np.any(self.time_remaining < 2.0)
+        
         goal_reward_val = 50.0
         success_bonus_val = 100.0
         timeout_penalty_val = -20.0
-        collision_penalty_val = -5.0
+        # Hybrid logic: collision penalty changes based on urgency
+        collision_penalty_val = -2.0 if is_urgent_mode else -5.0
         step_penalty = -0.05
 
         team_reward += step_penalty
@@ -234,19 +226,19 @@ class MultiAgentEnvironment:
                     num_collisions += 1
         team_reward += collision_penalty_val * num_collisions
 
-        all_agents_succeeded = True
+        all_agents_succeeded_this_step = True
         for i in range(self.num_agents):
             if np.linalg.norm(self.positions[i] - self.goals[i]) < self.goal_radius:
                 if self.time_remaining[i] > 0:
-                    team_reward += goal_reward_val # Give reward only once per agent
-                    self.goals[i] = self.positions[i] # "Deactivate" goal
+                    team_reward += goal_reward_val
+                    self.goals[i] = self.positions[i] # Deactivate goal
             else:
-                all_agents_succeeded = False
+                all_agents_succeeded_this_step = False
 
             if self.time_remaining[i] <= 0:
                 team_reward += timeout_penalty_val
 
-        if all_agents_succeeded:
+        if all_agents_succeeded_this_step:
             team_reward += success_bonus_val
         
         return team_reward
@@ -282,7 +274,6 @@ class MultiAgentTrainer:
         self.num_agents = env.num_agents
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # --- CHANGE --- : Create individual actors but a single shared critic and replay buffer
         self.actors = [Actor(env.state_dim, env.action_dim).to(self.device) for _ in range(self.num_agents)]
         self.actor_optimizers = [optim.Adam(actor.parameters(), lr=3e-4) for actor in self.actors]
         
@@ -292,68 +283,26 @@ class MultiAgentTrainer:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
         self.memory = ReplayBuffer(100000)
-        # --- CHANGE END ---
 
         self.batch_size = 256
         self.tau = 0.005
         self.gamma = 0.99
-        self.alpha = 0.2
+        
+        # --- CHANGE START: AUTOMATIC ENTROPY TUNING ---
+        self.target_entropy = -self.env.action_dim * self.num_agents
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
+        self.alpha = self.log_alpha.exp().item()
+        # --- CHANGE END ---
 
         self.episode_rewards = []
         self.success_rates = []
 
-    # def select_joint_action(self, states, graph_data, evaluate=False):
-    #     """Selects a joint action for all agents, with optional hybrid supervisor."""
-    #     actions = []
-    #     with torch.no_grad():
-    #         for i in range(self.num_agents):
-    #             # --- CHANGE START --- : Hybrid Rule-Based Supervisor
-    #             time_left = self.env.time_remaining[i]
-    #             pos = self.env.positions[i]
-                
-    #             # Find nearest neighbor distance
-    #             min_dist = float('inf')
-    #             for j in range(self.num_agents):
-    #                 if i != j:
-    #                     dist = np.linalg.norm(pos - self.env.positions[j])
-    #                     if dist < min_dist:
-    #                         min_dist = dist
-                
-    #             # Rule 1: Emergency collision avoidance
-    #             if min_dist < self.env.collision_radius * 1.5:
-    #                 # Move away from the average position of other agents
-    #                 avg_pos_others = np.mean([self.env.positions[j] for j in range(self.num_agents) if i != j], axis=0)
-    #                 avoid_vec = pos - avg_pos_others
-    #                 action_vec = avoid_vec / (np.linalg.norm(avoid_vec) + 1e-6)
-    #             # Rule 2: Rush to goal if time is low
-    #             elif time_left < 2.0: # 2 seconds threshold
-    #                 goal_vec = self.env.goals[i] - pos
-    #                 action_vec = goal_vec / (np.linalg.norm(goal_vec) + 1e-6)
-    #             # Default: Use the learned actor policy
-    #             else:
-    #                 state_tensor = torch.FloatTensor(states[i]).unsqueeze(0).to(self.device)
-    #                 agent_graph_data = Data(x=graph_data.x, edge_index=graph_data.edge_index, agent_index=i).to(self.device)
-    #                 if evaluate:
-    #                     mean, _ = self.actors[i](state_tensor, agent_graph_data)
-    #                     action_tensor = torch.tanh(mean)
-    #                 else:
-    #                     action_tensor, _ = self.actors[i].sample(state_tensor, agent_graph_data)
-    #                 action_vec = action_tensor.cpu().numpy().flatten()
-                
-    #             actions.append(action_vec)
-    #             # --- CHANGE END ---
-
-    #     return np.array(actions)
-    # In MultiAgentTrainer class
-    
     def select_joint_action(self, states, graph_data, evaluate=False):
-        """Selects a joint action for all agents."""
+        """Selects a joint action, using only the learned policies."""
         actions = []
         with torch.no_grad():
             for i in range(self.num_agents):
-                # --- CHANGE: TEMPORARILY DISABLE SUPERVISOR ---
-                # The original supervisor logic is commented out for this test.
-                # We now ALWAYS use the learned actor policy.
                 state_tensor = torch.FloatTensor(states[i]).unsqueeze(0).to(self.device)
                 agent_graph_data = Data(x=graph_data.x, edge_index=graph_data.edge_index, agent_index=i).to(self.device)
                 if evaluate:
@@ -384,11 +333,10 @@ class MultiAgentTrainer:
                 episode_reward += reward
                 
                 if len(self.memory) > self.batch_size:
-                    # --- CHANGE --- : Single centralized update per step
                     self.update_centralized()
 
                 if done: break
-
+            
             # success = 1.0 if np.all([np.linalg.norm(self.env.positions[i] - self.env.goals[i]) < self.env.goal_radius for i in range(self.num_agents)]) else 0.0
             success = np.mean([np.linalg.norm(self.env.positions[i] - self.env.goals[i]) < self.env.goal_radius for i in range(self.num_agents)])
             self.episode_rewards.append(episode_reward)
@@ -400,20 +348,19 @@ class MultiAgentTrainer:
                 print(f"Episode {episode}, Avg Reward (last 50): {avg_reward:.2f}, Avg Success (last 50): {avg_success:.2f}")
 
     def update_centralized(self):
-        """Performs a single update for the centralized critic and all actors."""
+        """Performs a single update for the centralized critic, all actors, and alpha."""
         batch = self.memory.sample(self.batch_size)
         
-        # Unpack batch and convert to tensors
         joint_states = torch.FloatTensor(np.array([t.joint_state for t in batch])).to(self.device)
         joint_actions = torch.FloatTensor(np.array([t.joint_action for t in batch])).to(self.device)
         rewards = torch.FloatTensor([t.reward for t in batch]).unsqueeze(1).to(self.device)
         joint_next_states = torch.FloatTensor(np.array([t.joint_next_state for t in batch])).to(self.device)
         dones = torch.tensor([t.done for t in batch], dtype=torch.bool).unsqueeze(1).to(self.device)
         
+        # --- Critic Update ---
         with torch.no_grad():
             next_actions_list, log_probs_list = [], []
             for i in range(self.num_agents):
-                # NOTE: For simplicity, GNN is not used in batch update, only for live action selection
                 action, log_prob = self.actors[i].sample(joint_next_states[:, i, :], graph_data=None)
                 next_actions_list.append(action)
                 log_probs_list.append(log_prob)
@@ -431,22 +378,34 @@ class MultiAgentTrainer:
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        # Update Individual Actors
+        # --- Actor and Alpha Update ---
+        new_actions_list, log_probs_list = [], []
         for i in range(self.num_agents):
             new_actions, log_probs = self.actors[i].sample(joint_states[:, i, :], graph_data=None)
-            
-            temp_joint_actions = joint_actions.clone()
-            temp_joint_actions[:, i, :] = new_actions
+            new_actions_list.append(new_actions)
+            log_probs_list.append(log_probs)
+        
+        joint_new_actions = torch.stack(new_actions_list, dim=1)
+        joint_log_probs = torch.cat(log_probs_list, dim=1).sum(dim=1, keepdim=True)
 
-            q1_new, q2_new = self.critic(joint_states, temp_joint_actions)
-            q_new = torch.min(q1_new, q2_new)
-            
-            actor_loss = (self.alpha * log_probs - q_new).mean()
-            self.actor_optimizers[i].zero_grad()
-            actor_loss.backward()
-            self.actor_optimizers[i].step()
+        q1_new, q2_new = self.critic(joint_states, joint_new_actions)
+        q_new = torch.min(q1_new, q2_new)
+        
+        actor_loss = (self.alpha * joint_log_probs - q_new).mean()
 
-        # Update Target Critic Network
+        for optim in self.actor_optimizers: optim.zero_grad()
+        actor_loss.backward()
+        for optim in self.actor_optimizers: optim.step()
+        
+        # --- CHANGE START: UPDATE ALPHA ---
+        alpha_loss = -(self.log_alpha.exp() * (joint_log_probs + self.target_entropy).detach()).mean()
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+        self.alpha = self.log_alpha.exp().item()
+        # --- CHANGE END ---
+
+        # --- Target Network Update ---
         with torch.no_grad():
             for target, source in zip(self.target_critic.parameters(), self.critic.parameters()):
                 target.data.mul_(1.0 - self.tau)
@@ -456,12 +415,16 @@ class MultiAgentTrainer:
         fig, ax1 = plt.subplots(figsize=(10, 5))
         ax1.set_xlabel('Episode')
         ax1.set_ylabel('Avg Reward (last 50)', color='tab:blue')
-        ax1.plot(np.convolve(self.episode_rewards, np.ones(50)/50, mode='valid'), color='tab:blue')
+        # Calculate running average for rewards
+        if len(self.episode_rewards) >= 50:
+            ax1.plot(np.convolve(self.episode_rewards, np.ones(50)/50, mode='valid'), color='tab:blue')
         ax1.tick_params(axis='y', labelcolor='tab:blue')
 
         ax2 = ax1.twinx()
         ax2.set_ylabel('Avg Success Rate (last 50)', color='tab:green')
-        ax2.plot(np.convolve(self.success_rates, np.ones(50)/50, mode='valid'), color='tab:green')
+        # Calculate running average for success rates
+        if len(self.success_rates) >= 50:
+            ax2.plot(np.convolve(self.success_rates, np.ones(50)/50, mode='valid'), color='tab:green')
         ax2.tick_params(axis='y', labelcolor='tab:green')
         
         fig.tight_layout()
@@ -473,6 +436,7 @@ class MultiAgentTrainer:
 
 if __name__ == "__main__":
     env = MultiAgentEnvironment(num_agents=4)
+    # --- CHANGE: Train for 3000 episodes for better convergence ---
     trainer = MultiAgentTrainer(env, num_episodes=500)
     
     print("Starting training...")
@@ -481,5 +445,4 @@ if __name__ == "__main__":
     trainer.train()
     trainer.plot_training_curves()
     
-    # Final demonstration can be added here if needed
     print("Training completed!")
