@@ -132,7 +132,7 @@ class Critic(nn.Module):
 # --- Simulation Environment ---
 
 class MultiAgentEnvironment:
-    def __init__(self, num_agents=4, world_size=10.0, communication_radius=4.0, max_episode_steps=100):
+    def __init__(self, num_agents=4, world_size=10.0, communication_radius=4.0, max_episode_steps=500):
         self.num_agents = num_agents
         self.world_size = world_size
         self.communication_radius = communication_radius
@@ -145,16 +145,48 @@ class MultiAgentEnvironment:
         self.dt = 0.1
         self.collision_radius = 0.5
         self.goal_radius = 0.3
+
+        # Tracker added
+        self.current_episode = 0
         
         self.reset()
     
+    # def reset(self):
+    #     self.positions = np.random.uniform(-self.world_size / 2, self.world_size / 2, (self.num_agents, 2))
+    #     self.velocities = np.zeros((self.num_agents, 2))
+    #     self.goals = np.random.uniform(-self.world_size / 2, self.world_size / 2, (self.num_agents, 2))
+        
+    #     distances_to_goal = np.linalg.norm(self.goals - self.positions, axis=1)
+    #     self.time_limits = distances_to_goal / (self.max_speed * 0.8) + 3.0
+    #     self.time_remaining = self.time_limits.copy()
+        
+    #     self.step_count = 0
+    #     self.done = False
+        
+    #     return self.get_observations()
+    
+    
+    # Reset function Changes (Added Modes) - Curriculum Learning Change
     def reset(self):
+        # Phase 1: Easy Mode (First third of training)
+        if self.current_episode < 1000:
+            self.goal_radius = 1.5  # Very large goals
+            time_buffer = 10.0      # Generous extra time
+        # Phase 2: Medium Mode (Second third of training)
+        elif self.current_episode < 2000:
+            self.goal_radius = 0.8  # Smaller goals
+            time_buffer = 6.0       # Less extra time
+        # Phase 3: Hard Mode (Final challenge)
+        else:
+            self.goal_radius = 0.3  # Original challenging goals
+            time_buffer = 3.0       # Original strict time limit
+
         self.positions = np.random.uniform(-self.world_size / 2, self.world_size / 2, (self.num_agents, 2))
         self.velocities = np.zeros((self.num_agents, 2))
         self.goals = np.random.uniform(-self.world_size / 2, self.world_size / 2, (self.num_agents, 2))
         
         distances_to_goal = np.linalg.norm(self.goals - self.positions, axis=1)
-        self.time_limits = distances_to_goal / (self.max_speed * 0.8) + 3.0
+        self.time_limits = distances_to_goal / (self.max_speed * 0.8) + time_buffer # Use the curriculum buffer
         self.time_remaining = self.time_limits.copy()
         
         self.step_count = 0
@@ -264,7 +296,7 @@ class MultiAgentEnvironment:
         else: plt.show()
         plt.close()
 
-# --- Training Orchestrator ---
+# Training Orchestrator
 
 class MultiAgentTrainer:
     """Manages the centralized training and decentralized execution process."""
@@ -284,16 +316,14 @@ class MultiAgentTrainer:
 
         self.memory = ReplayBuffer(100000)
 
-        self.batch_size = 256
+        self.batch_size = 512
         self.tau = 0.005
-        self.gamma = 0.99
+        self.gamma = 0.90
         
-        # --- CHANGE START: AUTOMATIC ENTROPY TUNING ---
         self.target_entropy = -self.env.action_dim * self.num_agents
         self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
         self.alpha = self.log_alpha.exp().item()
-        # --- CHANGE END ---
 
         self.episode_rewards = []
         self.success_rates = []
@@ -316,6 +346,8 @@ class MultiAgentTrainer:
 
     def train(self):
         for episode in range(self.num_episodes):
+            # Change to incorporate episode observation
+            self.env.current_episode = episode
             states = self.env.reset()
             episode_reward = 0
             
@@ -342,10 +374,10 @@ class MultiAgentTrainer:
             self.episode_rewards.append(episode_reward)
             self.success_rates.append(success)
 
-            if episode > 0 and episode % 50 == 0:
-                avg_reward = np.mean(self.episode_rewards[-50:])
-                avg_success = np.mean(self.success_rates[-50:])
-                print(f"Episode {episode}, Avg Reward (last 50): {avg_reward:.2f}, Avg Success (last 50): {avg_success:.2f}")
+            if episode > 0 and episode % 200 == 0:
+                avg_reward = np.mean(self.episode_rewards[-200:])
+                avg_success = np.mean(self.success_rates[-200:])
+                print(f"Episode {episode}, Avg Reward (last 200): {avg_reward:.2f}, Avg Success (last 200): {avg_success:.2f}")
 
     def update_centralized(self):
         """Performs a single update for the centralized critic, all actors, and alpha."""
@@ -397,15 +429,14 @@ class MultiAgentTrainer:
         actor_loss.backward()
         for optim in self.actor_optimizers: optim.step()
         
-        # --- CHANGE START: UPDATE ALPHA ---
+        # Update Alpha
         alpha_loss = -(self.log_alpha.exp() * (joint_log_probs + self.target_entropy).detach()).mean()
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
         self.alpha_optimizer.step()
         self.alpha = self.log_alpha.exp().item()
-        # --- CHANGE END ---
 
-        # --- Target Network Update ---
+        # Target Network Update
         with torch.no_grad():
             for target, source in zip(self.target_critic.parameters(), self.critic.parameters()):
                 target.data.mul_(1.0 - self.tau)
@@ -436,8 +467,7 @@ class MultiAgentTrainer:
 
 if __name__ == "__main__":
     env = MultiAgentEnvironment(num_agents=4)
-    # --- CHANGE: Train for 3000 episodes for better convergence ---
-    trainer = MultiAgentTrainer(env, num_episodes=500)
+    trainer = MultiAgentTrainer(env, num_episodes=3000)
     
     print("Starting training...")
     print(f"Device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
